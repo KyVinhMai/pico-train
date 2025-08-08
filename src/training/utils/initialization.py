@@ -16,6 +16,7 @@ from dataclasses import fields, is_dataclass
 from datetime import datetime
 from typing import Dict, Optional, Union
 
+
 import lightning as L
 import torch
 import wandb
@@ -26,8 +27,11 @@ from huggingface_hub import add_collection_item, create_branch, create_repo
 from lightning.fabric.loggers import Logger as FabricLogger
 from lightning.fabric.utilities.rank_zero import rank_zero_only
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from wandb.integration.lightning.fabric import WandbLogger
+import sentencepiece as spm
+from torch.nn.utils.rnn import pad_sequence
+
 
 from src.config import (
     CheckpointingConfig,
@@ -37,8 +41,9 @@ from src.config import (
     MonitoringConfig,
     TrainingConfig,
 )
-from src.model import PicoDecoder
+from src.model import PicoDecoder, initialize_gpt2_model
 from src.training.utils.io import use_backoff
+from src.training.utils.tokenizer_utils import initialize_sentencepiece_tokenizer
 
 warnings.filterwarnings(
     "ignore",
@@ -217,160 +222,253 @@ def initialize_fabric(
 ########################################################
 
 
-@use_backoff(max_retries=20)
+# @use_backoff(max_retries=20)
 def initialize_dataset(
     data_config: DataConfig,
     fabric: L.Fabric,
     initial_batch_step: Optional[int] = 0,
     return_fast_forward_steps: bool = False,
 ):
-    """Initialize dataset based on the given config.
+    """Initialize dataset based on the given config."""
+    from .data import ShardedIterableDataset
 
-    This function will return a dataset object, and optionally a fast_forward_steps value.
-
-    The fast_forward_steps value is the number of steps that we need to fast-forward an iterator by,
-    so that we can continue from a ertain batch of data we would have seen had training not previously
-    stopped. Depending on how the dataset is loaded, the amount of steps to fast-forward may be
-    different from the initial_batch_step value.
-
-    NOTE: This functionality is primarily useful for streaming datasets (which for large
-    datasets is most of the time).
-
-    Args:
-        data_config: Configuration object containing dataset settings.
-        fabric: A Lightning Fabric instance.
-        initial_batch_step: The initial batch step to fast-forward to.
-        return_fast_forward_steps: Whether to return the fast-forward steps value.
-
-    Returns:
-        Dataset: Initialized dataset object.
-        Optional[int]: Number of steps to fast-forward the iterator by, if return_fast_forward_steps is True.
-    """
-
-    datasets_config.STREAMING_READ_MAX_RETRIES = 40  # default is 20
-    datasets_config.STREAMING_READ_RETRY_INTERVAL = 10  # default is 5
-    download_config = DownloadConfig(
-        max_retries=20,  # default is 1 and can lead to pre-mature HTTPS errors
-    )
-
+    datasets_config.STREAMING_READ_MAX_RETRIES = 40
+    datasets_config.STREAMING_READ_RETRY_INTERVAL = 10
+    download_config = DownloadConfig(max_retries=20)
+    
     fast_forward_steps = 0
 
-    if data_config.dataset.name == "pico-lm/pretokenized-dolma":
-        # NOTE: We know that the dataset is sharded into 10,000 shards, so we can easily compute
-        # the data file that we need to load in that contains the batch of data at
-        # initial_batch_step.
+    print("Attempting to load dataset!...", flush=True)
 
-        if initial_batch_step is not None:
-            examples_per_shard = 20_480
-            total_shards = 10_000
-            batches_per_shard = examples_per_shard // data_config.dataloader.batch_size
-            shard_idx = initial_batch_step // batches_per_shard
+    if data_config.type == "huggingface":
+        print("Loading HuggingFace dataset...", flush=True)
 
-            data_files = [
-                f"data/train-{str(_shard_idx).zfill(5)}-of-{total_shards}.parquet"
-                for _shard_idx in range(shard_idx, total_shards)
-            ]
+        if data_config.dataset.name == "pico-lm/pretokenized-dolma":
+            # Handle Dolma dataset with sharding logic
+            if initial_batch_step is not None:
+                examples_per_shard = 20_480
+                total_shards = 10_000
+                batches_per_shard = examples_per_shard // data_config.dataloader.batch_size
+                shard_idx = initial_batch_step // batches_per_shard
 
-            fast_forward_steps = initial_batch_step % batches_per_shard
+                data_files = [
+                    f"data/train-{str(_shard_idx).zfill(5)}-of-{total_shards}.parquet"
+                    for _shard_idx in range(shard_idx, total_shards)
+                ]
+                fast_forward_steps = initial_batch_step % batches_per_shard
+            else:
+                data_files = None
+
+            base_dataset = load_dataset(
+                data_config.dataset.name,
+                split="train",
+                streaming=True,
+                data_files=data_files,
+                download_config=download_config,
+            )
+            
+            train_dataset = ShardedIterableDataset(
+                base_dataset, fabric.global_rank, fabric.world_size
+            )
+            val_dataset = None  # Dolma doesn't have a validation split in this setup
         else:
-            data_files = None
+            # Other HuggingFace datasets
+            base_dataset = load_dataset(
+                data_config.dataset.name,
+                split="train",
+                streaming=True,
+                download_config=download_config,
+            )
+            train_dataset = base_dataset
+            val_dataset = None
 
-        base_dataset = load_dataset(
-            data_config.dataset.name,
-            split="train",
-            streaming=True,
-            data_files=data_files,
-            download_config=download_config,
-        )
-    else:
-        # NOTE: For other datasets, you might want to add some custom loading logic, especially
-        # to help with loading or fast-forwarding to the correct batch.
+    else:  # Local dataset
+        print("Loading local dataset...", flush=True)
+        
+        # Load local text files
+        try:
+            # Use the 'text' loader for plain text files
+            dataset_dict = load_dataset(
+                'text', 
+                data_files={
+                    'train': data_config.dataset.train_dataset.path_id, 
+                    'test': data_config.dataset.val_dataset.path_id
+                },
+                streaming=False,  # Load into memory for local files
+                download_config=download_config,
+            )
+            
+            train_ds = dataset_dict['train']
+            test_ds = dataset_dict['test'] if 'test' in dataset_dict else None
+            
+            print(f"✅ Loaded train dataset with {len(train_ds)} examples", flush=True)
+            if test_ds:
+                print(f"✅ Loaded test dataset with {len(test_ds)} examples", flush=True)
+            
+            # Debug: Print a few samples to check format
+            print("📋 Sample data format:", flush=True)
+            for i in range(min(3, len(train_ds))):
+                sample = train_ds[i]
+                print(f"  Sample {i}: {type(sample)} - Keys: {sample.keys() if isinstance(sample, dict) else 'Not a dict'}")
+                if isinstance(sample, dict) and 'text' in sample:
+                    text_preview = sample['text'][:100] + "..." if len(sample['text']) > 100 else sample['text']
+                    print(f"    Text preview: {repr(text_preview)}")
+                else:
+                    print(f"    Raw sample: {sample}")
+            
+            # # Convert to iterable datasets for distributed training
+            # if data_config.streaming or len(train_ds) > 100000:  # Use streaming for large datasets
+            #     print("🔄 Converting to streaming datasets for distributed training...", flush=True)
+            #     train_dataset = ShardedIterableDataset(
+            #         train_ds.to_iterable_dataset(), fabric.global_rank, fabric.world_size
+            #     )
+            #     val_dataset = ShardedIterableDataset(
+            #         test_ds.to_iterable_dataset(), fabric.global_rank, fabric.world_size
+            #     ) if test_ds else None
+            # else:
+            #     # For smaller datasets, we can keep them as regular datasets
+            #     train_dataset = train_ds
+            #     val_dataset = test_ds
 
-        base_dataset = load_dataset(
-            data_config.dataset.name,
-            split="train",
-            streaming=True,
-            download_config=download_config,
-        )
-
-    if data_config.dataset.name == "pico-lm/pretokenized-dolma":
-        from .data import ShardedIterableDataset
-
-        # NOTE: We wrap the dataset in a ShardedIterableDataset, which is a custom class that
-        # allows us to shard an iterable dataset across multiple processes. This is useful for
-        # distributed training, where we want data-parallelism.
-        dataset = ShardedIterableDataset(
-            base_dataset, fabric.global_rank, fabric.world_size
-        )
-    else:
-        dataset = base_dataset
-
+            print("🔄 Converting to streaming datasets for distributed training...", flush=True)
+            train_dataset = ShardedIterableDataset(
+                train_ds.to_iterable_dataset(), fabric.global_rank, fabric.world_size
+            )
+            val_dataset = ShardedIterableDataset(
+                test_ds.to_iterable_dataset(), fabric.global_rank, fabric.world_size
+            ) if test_ds else None
+        
+            
+        except Exception as e:
+            print(f"❌ Error loading local dataset: {e}", flush=True)
+            print(f"   Train path: {data_config.dataset.train_dataset.path_id}")
+            print(f"   Val path: {data_config.dataset.val_dataset.path_id}")
+            raise
+    
+    print("✅ Dataset loading complete!", flush=True)
+    
     if return_fast_forward_steps:
-        return dataset, fast_forward_steps
+        return train_dataset, val_dataset, fast_forward_steps
     else:
-        return dataset
+        return train_dataset, val_dataset
 
 
-def initialize_tokenizer(data_config: DataConfig):
-    """Initialize the tokenizer for text processing.
+# def initialize_tokenizer(data_config: DataConfig):
+#     """Initialize the tokenizer for text processing.
 
-    This function can be extended to include custom tokenization logic.
+#     This function can be extended to include custom tokenization logic.
 
-    Args:
-        data_config: Configuration object containing tokenizer settings.
+#     Args:
+#         data_config: Configuration object containing tokenizer settings.
 
-    Returns:
-        AutoTokenizer: A HuggingFace tokenizer instance.
+#     Returns:
+#         AutoTokenizer: A HuggingFace tokenizer instance.
+#     """
+
+#     if data_config.tokenizer.type == "local":
+#         tokenizer = spm.SentencePieceProcessor(model_file=str(data_config.tokenizer.path_id))
+#         return tokenizer
+
+#     return AutoTokenizer.from_pretrained(data_config.tokenizer.name)
+
+# def initialize_tokenizer(data_config: DataConfig):
+#     """Initialize the tokenizer for text processing with SentencePiece support."""
+    
+#     tokenizer_name = data_config.tokenizer.path_id
+    
+#     # Check if this is a SentencePiece model path
+#     if tokenizer_name.endswith('.model') or tokenizer_name.endswith('.sp'):
+#         # This is a SentencePiece model file
+#         return SentencePieceTokenizerWrapper(
+#             model_path=tokenizer_name,
+#             # You can customize these special tokens as needed
+#             bos_token="<s>", 
+#             eos_token="</s>",
+#             unk_token="<unk>",
+#             pad_token="<pad>"
+#         )
+#     else:
+#         # Fall back to HuggingFace AutoTokenizer
+#         return AutoTokenizer.from_pretrained(tokenizer_name)
+
+def initialize_tokenizer(data_config):
     """
-
-    return AutoTokenizer.from_pretrained(data_config.tokenizer.name)
+    Initialize tokenizer based on data config for training.
+    
+    This replaces the standard initialize_tokenizer function in your training utils.
+    """
+    tokenizer_name = data_config.tokenizer.path_id
+    
+    # Check if this is a path to a SentencePiece model
+    if tokenizer_name.endswith('.model') or os.path.exists(tokenizer_name):
+        return initialize_sentencepiece_tokenizer(
+            model_path=tokenizer_name,
+            vocab_size=getattr(data_config.tokenizer, 'vocab_size', None)
+        )
+    else:
+        return AutoTokenizer.from_pretrained(tokenizer_name)
 
 
 def initialize_dataloader(
-    data_config: DataConfig,
-    training_config: TrainingConfig,
+    data_config: 'DataConfig',
+    training_config: 'TrainingConfig',
     fabric: L.Fabric,
-    dataset: Dataset,
+    train_dataset: 'Dataset',
+    val_dataset: 'Dataset',
+    tokenizer  # <-- 1. Add tokenizer_path as an argument
 ):
-    """Initialize the DataLoader for efficient batch processing.
+    """Initialize the DataLoader with on-the-fly tokenization and padding."""
 
-    Creates a PyTorch DataLoader that handles batching and data loading for training.
-    Configured specifically for streaming tokenized text datasets.
-
-    You might also want to extend this function to add a sampler, or some sort of custom
-    collate function. For the default dataset, we don't need any of this, because the data are
-    pre-shuffled, and pre-tokenized.
-
-    Args:
-        data_config: Configuration object containing dataloader settings.
-        training_config: Configuration object containing training settings.
-        fabric: A Lightning Fabric instance.
-        dataset: A HuggingFace Dataset object containing tokenized text data.
-            Expected to have 'input_ids' field in its items.
-
-    Returns:
-        DataLoader: PyTorch DataLoader instance configured for the dataset.
-    """
+    pad_id = tokenizer.pad_token_id # Get the padding token ID
 
     def _collate_fn(batch):
-        return {"input_ids": [entry["input_ids"] for entry in batch]}
+        """
+        Processes a batch of raw text, tokenizes, and pads sequences.
+        `batch` is a list of dictionaries, e.g., [{'text': '...'}, {'text': '...'}]
+        """
+        # 3. Extract the raw text from each sample in the batch
+        # This assumes your dataset items are dictionaries with a 'text' key.
+        # Adjust the key if your dataset uses a different one (e.g., 'sentence').
+        texts = [entry['text'] for entry in batch]
 
+        # 4. Tokenize each text string and convert to a PyTorch tensor
+        # We add BOS/EOS tokens for good measure, as many models expect them.
+        tokenized_batch = [
+            torch.tensor([tokenizer.bos_token_id] + tokenizer.encode(text) + [tokenizer.eos_token_id])
+            for text in texts
+        ]
+
+        # 5. Pad all sequences in the batch to the same length
+        # `pad_sequence` creates a rectangular tensor.
+        padded_batch = pad_sequence(
+            tokenized_batch, batch_first=True, padding_value=pad_id
+        )
+
+        # 6. Return a dictionary containing the single, padded tensor
+        return {"input_ids": padded_batch}
+
+    # The logic for calculating sub-batch size remains the same
     sub_batch_size = data_config.dataloader.batch_size // (
         fabric.world_size * training_config.optimization.gradient_accumulation_steps
     )
 
-    # NOTE: We use the sub-batch size for the dataloader, which is the full batch size
-    # divided by the gradient accumulation steps. This ensures that the effective batch size
-    # is correct.
-
-    return DataLoader(
-        dataset,
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_size=sub_batch_size,
-        shuffle=False,  # Keep sequential for streaming datasets
-        pin_memory=True,  # Speeds up transfer to GPU
+        # shuffle=True,  # Shuffle is generally recommended unless you have a reason not to
+        pin_memory=True,
+        collate_fn=_collate_fn, # Use our new, powerful collate function
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=sub_batch_size,
+        # shuffle=False,
+        pin_memory=True,
         collate_fn=_collate_fn,
     )
 
+    return train_dataloader, val_dataloader
 
 ########################################################
 #
@@ -378,29 +476,24 @@ def initialize_dataloader(
 #
 ########################################################
 
-
 def initialize_model(model_config: ModelConfig):
-    """Initialize the model for training.
-
-    Loads in a given model implemented in the `src.model` package and returns it.
-
-    NOTE: out of the box we currently only support the PicoDecoder model (a causal transformer
-    language model). If you'd like to implement your own model, you can do so by adding a new
-    model class in the `src.model` package, and then adding a new entry here.
-
+    """Initialize a custom Pico model for training.
+    
     Args:
-        model_config: Configuration object containing model settings.
-
+        model_config: Configuration object containing custom model settings.
+        
     Returns:
-        PyTorch model instance.
-
+        PyTorch model instance (PicoDecoder).
     """
     if model_config.model_type == "pico_decoder":
         return PicoDecoder(model_config)
+    elif model_config.model_type == "gpt2":
+        return initialize_gpt2_model(model_config)
+    elif model_config.model_type == "huggingface":
+        return AutoModelForCausalLM.load(model_config["model_checkpoint"])
     else:
-        raise ValueError(f"Invalid model type: {model_config.model_type}")
-
-
+        raise ValueError(f"Invalid custom model type: {model_config.model_type}")
+    
 ########################################################
 #
 # Optimizer and Scheduler
@@ -429,7 +522,7 @@ def initialize_optimizer(training_config: TrainingConfig, model: torch.nn.Module
 
     if training_config.optimization.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=training_config.optimization.lr
+            model.parameters(), lr=float(training_config.optimization.lr)
         )
     else:
         raise ValueError(f"Invalid optimizer: {training_config.optimization.optimizer}")
@@ -575,51 +668,91 @@ def initialize_wandb(
     return wandb_logger
 
 
+# @rank_zero_only
+# def initialize_logging(
+#     monitoring_config: MonitoringConfig,
+#     checkpointing_config: CheckpointingConfig,
+#     fabric: L.Fabric,
+# ):
+#     """Initialize logging system with default logging, to file and console.
+
+#     The default logging system uses a file handler and a stream handler.
+
+#     NOTE: this function is only called on rank 0.
+
+#     Args:
+#         monitoring_config: Configuration object containing monitoring settings.
+#         checkpointing_config: Configuration object containing checkpointing settings.
+
+#     Returns:
+#         logger: Standard Python logger configured for file and console output
+#     """
+
+#     # ---- Standard Local Logger ---- #
+#     logger = logging.getLogger("pico-train")
+#     logger.setLevel(logging.INFO)
+
+#     # Create file handler
+#     log_file_path = _initialize_log_file(checkpointing_config)
+#     file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+#     file_handler.setLevel(monitoring_config.logging.log_level)
+
+#     # Create formatter and add it to the handler
+#     formatter = logging.Formatter(
+#         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+#         datefmt="%Y-%m-%d %H:%M:%S",
+#     )
+#     file_handler.setFormatter(formatter)
+
+#     # Add the handler to the logger
+#     logger.addHandler(file_handler)
+
+#     # Add a stream handler for console output
+#     stream_handler = logging.StreamHandler()
+#     stream_handler.setLevel(monitoring_config.logging.log_level)
+#     stream_handler.setFormatter(formatter)
+#     logger.addHandler(stream_handler)
+
+#     return logger
+
 @rank_zero_only
 def initialize_logging(
     monitoring_config: MonitoringConfig,
     checkpointing_config: CheckpointingConfig,
     fabric: L.Fabric,
 ):
-    """Initialize logging system with default logging, to file and console.
-
-    The default logging system uses a file handler and a stream handler.
-
-    NOTE: this function is only called on rank 0.
-
-    Args:
-        monitoring_config: Configuration object containing monitoring settings.
-        checkpointing_config: Configuration object containing checkpointing settings.
-
-    Returns:
-        logger: Standard Python logger configured for file and console output
-    """
-
-    # ---- Standard Local Logger ---- #
+    """Initialize HPC-friendly logging system."""
+    
     logger = logging.getLogger("pico-train")
     logger.setLevel(logging.INFO)
-
-    # Create file handler
-    log_file_path = _initialize_log_file(checkpointing_config)
+    
+    # Use local temp directory for log file instead of shared storage
+    log_dir = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(log_dir, f"pico_train_{timestamp}.log")
+    
+    # Create file handler with buffering disabled for HPC
     file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
     file_handler.setLevel(monitoring_config.logging.log_level)
-
-    # Create formatter and add it to the handler
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    
+    # Simple formatter to reduce overhead
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     file_handler.setFormatter(formatter)
-
-    # Add the handler to the logger
     logger.addHandler(file_handler)
-
-    # Add a stream handler for console output
-    stream_handler = logging.StreamHandler()
+    
+    # Use stdout instead of stderr and force flushing
+    import sys
+    stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(monitoring_config.logging.log_level)
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
-
+    
+    # Force immediate flushing for HPC environments
+    for handler in logger.handlers:
+        handler.flush()
+    
     return logger
 
 

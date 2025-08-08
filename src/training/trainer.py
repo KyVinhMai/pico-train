@@ -94,6 +94,7 @@ class Trainer:
             wandb_logger=wandb_logger,
         )
         L.seed_everything(42, verbose=False)
+        print("Set up fabric!...", flush=True)
 
         # Set up logging
         self.logger = initialize_logging(
@@ -119,6 +120,8 @@ class Trainer:
             initialize_hf_checkpointing(
                 checkpointing_config=self.configs["checkpointing"], fabric=self.fabric
             )
+            
+        print("Set up maodel!...", flush=True)
 
         ########################################################
         #
@@ -157,24 +160,36 @@ class Trainer:
         #
         ########################################################
 
-        self.train_dataset, fast_forward_steps = initialize_dataset(
+        self.tokenizer = initialize_tokenizer(data_config=self.configs["data"])
+
+        print("Set up tokenizer!...", flush=True)
+
+        self.train_dataset, self.val_dataset, fast_forward_steps = initialize_dataset(
             data_config=self.configs["data"],
             fabric=self.fabric,
             initial_batch_step=self.initial_batch_step,
             return_fast_forward_steps=True,
         )
 
-        self.train_dataloader = initialize_dataloader(
+        print("intializiing dataset!...", flush=True)
+    
+
+        self.train_dataloader, self.val_dataloader = initialize_dataloader(
             data_config=self.configs["data"],
             training_config=self.configs["training"],
             fabric=self.fabric,
-            dataset=self.train_dataset,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            tokenizer=self.tokenizer
         )
+
         self.train_dataloader = self.fabric.setup_dataloaders(
             self.train_dataloader, use_distributed_sampler=False
         )
 
-        self.tokenizer = initialize_tokenizer(data_config=self.configs["data"])
+        self.val_dataloader = self.fabric.setup_dataloaders(
+            self.val_dataloader, use_distributed_sampler=False
+        )
 
         # NOTE: We may need to fast-forward the iterator to the correct step so that we can
         # continue from the correct batch of data we would have seen had training not
@@ -189,6 +204,7 @@ class Trainer:
                 next(train_iterator)
 
         self.train_iterator = train_iterator
+        self.val_iterator = iter(self.val_dataloader)
 
         # NOTE: Sychronizing processes after fast-forwarding iterator
         self.fabric.barrier()
@@ -375,6 +391,59 @@ class Trainer:
 
         self.fabric.barrier()
 
+    def _validation_loop(self) -> dict:
+        """Execute validation loop without model updates.
+        
+        Returns:
+            dict: Validation metrics including average loss and inf/nan counts
+        """
+        self.model.eval()  # Set model to evaluation mode
+        
+        # Validation metrics tracking
+        total_loss = torch.tensor(0.0, device=self.fabric.device)
+        total_steps = torch.tensor(0, device=self.fabric.device)
+        total_inf_or_nan_count = torch.tensor(0, device=self.fabric.device)
+        
+        # Use validation iterator (you'll need to create this)
+        with torch.no_grad():  # Disable gradient computation for entire validation
+            for sub_batch_step, sub_batch in enumerate(self.val_iterator):
+                # Forward Pass
+                _input_ids = torch.tensor(sub_batch["input_ids"], device=self.fabric.device)
+                input_ids = _input_ids[:, :-1]
+                labels = _input_ids[:, 1:]
+
+                # Forward pass only - no backward sync needed
+                model_output, _ = self.model(input_ids)
+                model_output = model_output.transpose(1, 2)
+                
+                loss = F.cross_entropy(model_output, labels)
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    total_inf_or_nan_count += 1
+                else:
+                    total_loss += loss.item()
+                    total_steps += 1
+        
+        # Calculate final validation metrics
+        gathered_total_loss = self.fabric.all_reduce(total_loss, reduce_op="sum").item()
+        gathered_total_steps = self.fabric.all_reduce(total_steps, reduce_op="sum").item()
+        gathered_inf_or_nan_count = self.fabric.all_reduce(total_inf_or_nan_count, reduce_op="sum").item()
+        
+        avg_val_loss = (
+            gathered_total_loss / gathered_total_steps
+            if gathered_total_steps > 0
+            else float("inf")
+        )
+        
+        self.model.train()  # Set model back to training mode
+        
+        return {
+            "val_loss": avg_val_loss,
+            "val_inf_or_nan_count": gathered_inf_or_nan_count,
+            "val_steps": gathered_total_steps
+        }
+
+
     def _training_loop(self) -> int:
         """Execute the main training loop.
 
@@ -429,13 +498,16 @@ class Trainer:
                 batch_step % self.configs["checkpointing"].save_every_n_steps == 0
             )
 
+            print("In Training Loop!...", flush=True)
+
             ########################################################
             #
             # Forward Pass
             #
             ########################################################
 
-            _input_ids = torch.tensor(sub_batch["input_ids"], device=self.fabric.device)
+            # _input_ids = torch.tensor(sub_batch["input_ids"], device=self.fabric.device)
+            _input_ids = sub_batch["input_ids"].detach().clone().to(self.fabric.device)
             input_ids = _input_ids[:, :-1]
             labels = _input_ids[:, 1:]
 
@@ -452,6 +524,7 @@ class Trainer:
                 training_batch["input_ids"].extend(gathered_input_ids.tolist())
 
             # Forward pass
+            print("Doing Forward Pass!...", flush=True)
             model_output, _ = self.model(input_ids)
             model_output = model_output.transpose(1, 2)
 
@@ -485,6 +558,8 @@ class Trainer:
             if should_accumulate_gradients:
                 continue
 
+            print("Accumulated Gradients!...", flush=True)
+
             ########################################################
             #
             # Logging
@@ -501,6 +576,13 @@ class Trainer:
                 interval_loss = torch.tensor(0.0, device=self.fabric.device)
                 interval_steps = torch.tensor(0, device=self.fabric.device)
                 interval_inf_or_nan_count = torch.tensor(0, device=self.fabric.device)
+
+
+            # Validation
+            if batch_step % self.configs["validation"].log_every_n_steps == 0:
+                val_metrics = self._validation_loop()
+                self._log_validation_metrics(val_metrics, batch_step)
+
 
             ########################################################
             #
@@ -610,6 +692,34 @@ class Trainer:
     # Trainer Logging Functinalities
     #
     ########################################################
+
+
+    def _log_validation_metrics(
+        self,
+        val_metrics: dict,
+        batch_step: int,
+    ):
+        """
+        Log validation metrics in a tree-style format similar to training metrics.
+        """
+        val_loss = val_metrics["val_loss"]
+        val_inf_or_nan_count = val_metrics["val_inf_or_nan_count"]
+        val_steps = val_metrics["val_steps"]
+        
+        # Log to experiment tracking (WandB, etc.)
+        self.fabric.log("val/loss", val_loss, step=batch_step)
+        self.fabric.log("val/inf_or_nan_count", val_inf_or_nan_count, step=batch_step)
+        
+        # Calculate perplexity for additional insight
+        val_perplexity = torch.exp(torch.tensor(val_loss)).item() if val_loss != float("inf") else float("inf")
+        self.fabric.log("val/perplexity", val_perplexity, step=batch_step)
+        
+        # Log to console in tree format
+        self.log(f"Step {batch_step} -- ◉_◉ Validation Metrics")
+        self.log(f"├── Loss: {val_loss:.4f}")
+        self.log(f"├── Perplexity: {val_perplexity:.4f}")
+        self.log(f"├── Steps: {val_steps}")
+        self.log(f"└── Inf/NaN count: {val_inf_or_nan_count}")
 
     def _log_training_metrics(
         self,
